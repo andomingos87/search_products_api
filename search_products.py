@@ -1,0 +1,145 @@
+# search_products.py
+import os
+import argparse
+import psycopg2
+from psycopg2.extras import RealDictCursor
+from dotenv import load_dotenv
+from openai import OpenAI
+
+load_dotenv()
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+EMB_MODEL = os.getenv("EMB_MODEL", "text-embedding-3-small")
+EMB_DIM = int(os.getenv("EMB_DIM", "1536"))
+
+# Variáveis de banco separadas (em vez de DATABASE_URL)
+DB_HOST = os.getenv("DB_HOST")
+DB_PORT = int(os.getenv("DB_PORT", "5432"))
+DB_USER = os.getenv("DB_USER")
+DB_PASSWORD = os.getenv("DB_PASSWORD")
+DB_NAME = os.getenv("DB_NAME")
+
+client = OpenAI(api_key=OPENAI_API_KEY)
+
+def to_pgvector(vec):
+    return "[" + ",".join(f"{float(x):.7f}" for x in vec) + "]"
+
+def embed_query(q: str):
+    e = client.embeddings.create(model=EMB_MODEL, input=q)
+    v = e.data[0].embedding
+    if len(v) != EMB_DIM:
+        raise RuntimeError(f"Embedding dim {len(v)} != {EMB_DIM}")
+    return v
+
+def search_products(q: str, k: int = 8,
+                    k_vec: int = 50, k_ft: int = 30, k_trgm: int = 15,
+                    alpha: float = 0.55, beta: float = 0.35, gamma: float = 0.10):
+    assert OPENAI_API_KEY, "Configure OPENAI_API_KEY no .env"
+    assert all([DB_HOST, DB_USER, DB_PASSWORD, DB_NAME]), (
+        "Configure DB_HOST, DB_PORT, DB_USER, DB_PASSWORD e DB_NAME no .env"
+    )
+
+    with psycopg2.connect(
+        host=DB_HOST,
+        port=DB_PORT,
+        user=DB_USER,
+        password=DB_PASSWORD,
+        dbname=DB_NAME,
+    ) as con, con.cursor(cursor_factory=RealDictCursor) as cur:
+        # 1) determinístico por SKU/EAN
+        cur.execute("SELECT * FROM rag.find_by_code(%s, %s);", (q, 5))
+        det = cur.fetchall()
+        if len(det) == 1:
+            r = det[0]
+            return {
+                "method": "deterministic",
+                "confidence": 1.0,
+                "results": [{
+                    "sku": r["sku"], "codigo_barras": r["codigo_barras"],
+                    "name": r["name"], "reason": r["reason"], "score": 1.0
+                }]
+            }
+
+        # 2) híbrido: vetorial + full-text (+ trigram)
+        qvec = to_pgvector(embed_query(q))
+
+        cur.execute("SELECT product_id, sku, name, codigo_barras, dist FROM rag.search_vec(%s::vector, %s);",
+                    (qvec, k_vec))
+        vec_rows = cur.fetchall()
+
+        cur.execute("SELECT product_id, sku, name, codigo_barras, score_ft FROM rag.search_ft(%s, %s);",
+                    (q, k_ft))
+        ft_rows = cur.fetchall()
+
+        # trigram opcional (pg_trgm); se não existir, ignora
+        trgm_rows = []
+        try:
+            cur.execute("""
+                SELECT id AS product_id, sku, name, codigo_barras,
+                       similarity(name, %s) AS score_trgm
+                FROM rag.products
+                WHERE name % %s
+                ORDER BY score_trgm DESC
+                LIMIT %s;
+            """, (q, q, k_trgm))
+            trgm_rows = cur.fetchall()
+        except Exception:
+            trgm_rows = []
+
+    # 3) fusão + normalização
+    items = {}
+    def put(rows, key, val_fn):
+        for r in rows:
+            sku = r["sku"]
+            it = items.setdefault(sku, {
+                "sku": sku, "name": r["name"], "codigo_barras": r["codigo_barras"], "scores": {}
+            })
+            it["scores"][key] = float(val_fn(r))
+
+    put(vec_rows, "vec", lambda r: max(0.0, 1.0 - float(r["dist"])))   # cosine -> similaridade
+    put(ft_rows, "ft", lambda r: float(r["score_ft"]))
+    put(trgm_rows, "trgm", lambda r: float(r["score_trgm"] or 0.0))
+
+    max_vec = max((it["scores"].get("vec", 0.0) for it in items.values()), default=0.0)
+    max_ft = max((it["scores"].get("ft", 0.0) for it in items.values()), default=0.0)
+    max_tr = max((it["scores"].get("trgm", 0.0) for it in items.values()), default=0.0)
+
+    # re-normaliza pesos se algum canal não trouxe nada
+    w_vec, w_ft, w_tr = alpha, beta, gamma
+    total = 0.0
+    if max_vec > 0: total += w_vec
+    else: w_vec = 0.0
+    if max_ft > 0: total += w_ft
+    else: w_ft = 0.0
+    if max_tr > 0: total += w_tr
+    else: w_tr = 0.0
+    if total > 0:
+        w_vec /= total; w_ft /= total; w_tr /= total
+
+    results = []
+    for sku, it in items.items():
+        vn = (it["scores"].get("vec", 0.0) / max_vec) if max_vec > 0 else 0.0
+        fn = (it["scores"].get("ft", 0.0) / max_ft) if max_ft > 0 else 0.0
+        tn = (it["scores"].get("trgm", 0.0) / max_tr) if max_tr > 0 else 0.0
+        score = w_vec * vn + w_ft * fn + w_tr * tn
+        results.append({
+            "sku": sku, "name": it["name"], "codigo_barras": it["codigo_barras"],
+            "score": round(score, 4), "vec": round(vn, 4), "ft": round(fn, 4), "trgm": round(tn, 4)
+        })
+
+    results.sort(key=lambda x: x["score"], reverse=True)
+    confidence = results[0]["score"] if results else 0.0
+    return {
+        "method": "hybrid" if det == [] else "hybrid_with_deterministic_candidates",
+        "confidence": round(confidence, 4),
+        "weights": {"vec": round(w_vec, 2), "ft": round(w_ft, 2), "trgm": round(w_tr, 2)},
+        "results": results[:k]
+    }
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--q", required=True, help="consulta do usuário")
+    ap.add_argument("--k", type=int, default=8)
+    args = ap.parse_args()
+    out = search_products(args.q, k=args.k)
+    import json
+    print(json.dumps(out, ensure_ascii=False, indent=2))
