@@ -32,6 +32,8 @@ CSV_PATH = "resumido_200.csv"
 LIMIT = None
 SEP = None
 ENCODING = None
+START = 5000   # início (base 0). Para próximas 5000, usar 5000
+COUNT = 1000   # quantidade a processar a partir de START
 
  # ---------- Leitura robusta de CSV ----------
 def diagnose_csv(csv_path: str, sep: str, encoding: str) -> list[tuple[int, int, int, str]]:
@@ -289,6 +291,13 @@ def main(csv_path: str, limit: int | None = None, sep: str | None = None, encodi
 
     if limit is not None and limit > 0:
         df = df.head(limit)
+
+    # Aplica slice START/COUNT para processar um lote específico
+    if COUNT is not None and COUNT > 0:
+        start_idx = START or 0
+        end_idx = start_idx + COUNT
+        df = df.iloc[start_idx:end_idx]
+
     total = len(df)
     print(f"Linhas no CSV: {total}")
 
