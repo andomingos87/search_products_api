@@ -31,8 +31,9 @@ def embed_query(q: str):
     return v
 
 def search_products(q: str, k: int = 8,
-                    k_vec: int = 50, k_ft: int = 30, k_trgm: int = 15,
-                    alpha: float = 0.55, beta: float = 0.35, gamma: float = 0.10):
+                    k_vec: int = 50, k_ft: int = 30, k_trgm: int = 15, k_kw: int = 50,
+                    alpha: float = 0.50, beta: float = 0.30, gamma: float = 0.10, delta: float = 0.10,
+                    require_kw_when_available: bool = True):
     assert OPENAI_API_KEY, "Configure OPENAI_API_KEY no .env"
     assert all([DB_HOST, DB_USER, DB_PASSWORD, DB_NAME]), (
         "Configure DB_HOST, DB_PORT, DB_USER, DB_PASSWORD e DB_NAME no .env"
@@ -85,6 +86,56 @@ def search_products(q: str, k: int = 8,
         except Exception:
             trgm_rows = []
 
+        # 2.1) canal extra: correspondência por palavra‑chave (ILIKE/unaccent) em name/description
+        # Ajuda muito para termos curtos como "cimento". Nome tem peso maior que descrição.
+        kw_rows = []
+        try:
+            # Monta padrões simples para múltiplas palavras (qualquer termo)
+            tokens = [t for t in (q or "").strip().split() if t]
+            if not tokens:
+                tokens = [q]
+            like_patterns = [f"%{t}%" for t in tokens]
+
+            # Constrói cláusulas OR para name/description
+            # Pontua 2 se nome casar, +1 se descrição casar
+            where_clauses = []
+            params = []
+            for pat in like_patterns:
+                where_clauses.append("(name ILIKE %s OR description ILIKE %s)")
+                params.extend([pat, pat])
+            where_sql = " OR ".join([f"({wc})" for wc in where_clauses]) or "TRUE"
+            # Primeiro tenta com unaccent (se extensão existir); se falhar, cai no ILIKE simples
+            try:
+                sql_kw = f"""
+                    SELECT id AS product_id, sku, name, codigo_barras,
+                           ((CASE WHEN unaccent(name) ILIKE unaccent(%s) THEN 2 ELSE 0 END) +
+                            (CASE WHEN unaccent(description) ILIKE unaccent(%s) THEN 1 ELSE 0 END))::float AS score_kw
+                    FROM rag.products
+                    WHERE {where_sql}
+                    ORDER BY score_kw DESC, name ASC
+                    LIMIT %s;
+                """
+                base_pat = f"%{q}%"
+                exec_params = [base_pat, base_pat, *params, k_kw]
+                cur.execute(sql_kw, exec_params)
+                kw_rows = cur.fetchall()
+            except Exception:
+                sql_kw = f"""
+                    SELECT id AS product_id, sku, name, codigo_barras,
+                           ((CASE WHEN name ILIKE %s THEN 2 ELSE 0 END) +
+                            (CASE WHEN description ILIKE %s THEN 1 ELSE 0 END))::float AS score_kw
+                    FROM rag.products
+                    WHERE {where_sql}
+                    ORDER BY score_kw DESC, name ASC
+                    LIMIT %s;
+                """
+                base_pat = f"%{q}%"
+                exec_params = [base_pat, base_pat, *params, k_kw]
+                cur.execute(sql_kw, exec_params)
+                kw_rows = cur.fetchall()
+        except Exception:
+            kw_rows = []
+
     # 3) fusão + normalização
     items = {}
     def put(rows, key, val_fn):
@@ -98,13 +149,15 @@ def search_products(q: str, k: int = 8,
     put(vec_rows, "vec", lambda r: max(0.0, 1.0 - float(r["dist"])))   # cosine -> similaridade
     put(ft_rows, "ft", lambda r: float(r["score_ft"]))
     put(trgm_rows, "trgm", lambda r: float(r["score_trgm"] or 0.0))
+    put(kw_rows, "kw", lambda r: float(r.get("score_kw", 0.0)))
 
     max_vec = max((it["scores"].get("vec", 0.0) for it in items.values()), default=0.0)
     max_ft = max((it["scores"].get("ft", 0.0) for it in items.values()), default=0.0)
     max_tr = max((it["scores"].get("trgm", 0.0) for it in items.values()), default=0.0)
+    max_kw = max((it["scores"].get("kw", 0.0) for it in items.values()), default=0.0)
 
     # re-normaliza pesos se algum canal não trouxe nada
-    w_vec, w_ft, w_tr = alpha, beta, gamma
+    w_vec, w_ft, w_tr, w_kw = alpha, beta, gamma, delta
     total = 0.0
     if max_vec > 0: total += w_vec
     else: w_vec = 0.0
@@ -112,26 +165,32 @@ def search_products(q: str, k: int = 8,
     else: w_ft = 0.0
     if max_tr > 0: total += w_tr
     else: w_tr = 0.0
+    if max_kw > 0: total += w_kw
+    else: w_kw = 0.0
     if total > 0:
-        w_vec /= total; w_ft /= total; w_tr /= total
+        w_vec /= total; w_ft /= total; w_tr /= total; w_kw /= total
 
     results = []
     for sku, it in items.items():
         vn = (it["scores"].get("vec", 0.0) / max_vec) if max_vec > 0 else 0.0
         fn = (it["scores"].get("ft", 0.0) / max_ft) if max_ft > 0 else 0.0
         tn = (it["scores"].get("trgm", 0.0) / max_tr) if max_tr > 0 else 0.0
-        score = w_vec * vn + w_ft * fn + w_tr * tn
+        kn = (it["scores"].get("kw", 0.0) / max_kw) if max_kw > 0 else 0.0
+        score = w_vec * vn + w_ft * fn + w_tr * tn + w_kw * kn
         results.append({
             "sku": sku, "name": it["name"], "codigo_barras": it["codigo_barras"],
-            "score": round(score, 4), "vec": round(vn, 4), "ft": round(fn, 4), "trgm": round(tn, 4)
+            "score": round(score, 4), "vec": round(vn, 4), "ft": round(fn, 4), "trgm": round(tn, 4), "kw": round(kn, 4)
         })
 
     results.sort(key=lambda x: x["score"], reverse=True)
+    # 3.1) Se houver quaisquer itens com match por palavra‑chave, prioriza apenas esses no top
+    if require_kw_when_available and any(r.get("kw", 0.0) > 0.0 for r in results):
+        results = [r for r in results if r.get("kw", 0.0) > 0.0] or results
     confidence = results[0]["score"] if results else 0.0
     return {
         "method": "hybrid" if det == [] else "hybrid_with_deterministic_candidates",
         "confidence": round(confidence, 4),
-        "weights": {"vec": round(w_vec, 2), "ft": round(w_ft, 2), "trgm": round(w_tr, 2)},
+        "weights": {"vec": round(w_vec, 2), "ft": round(w_ft, 2), "trgm": round(w_tr, 2), "kw": round(w_kw, 2)},
         "results": results[:k]
     }
 

@@ -2,7 +2,7 @@ from pathlib import Path
 import csv
 
 # Configurações internas (ajuste conforme necessário)
-INPUT_FILE = "resumido_2000.csv"
+INPUT_FILE = "produtos-copafer-2.csv"
 DELIMITER = ";"
 QUOTECHAR = '"'
 HAS_HEADER = True  # se True, considera a primeira linha como cabeçalho
