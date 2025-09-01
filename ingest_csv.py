@@ -309,6 +309,9 @@ def main(csv_path: str, limit: int | None = None, sep: str | None = None, encodi
 
             for _, r in tqdm(df.iterrows(), total=total, desc="Processando"):
                 sku = norm_str(r["codigo_produto"])
+                # Normaliza SKU removendo pontos (ex.: "353.3" -> "3533")
+                if sku:
+                    sku = sku.replace(".", "").strip()
                 if not sku:
                     continue  # ignora linhas sem código
 
